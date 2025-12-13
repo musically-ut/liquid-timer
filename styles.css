@@ -35,7 +35,7 @@ body {
 .timer-controls {
     position: relative;
     z-index: 10;
-    background: rgba(255, 255, 255, 0.95);
+    background: linear-gradient(135deg, rgba(102, 126, 234, 0.75) 0%, rgba(118, 75, 162, 0.75) 100%);
     padding: 2rem;
     border-radius: 20px;
     box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
@@ -46,13 +46,14 @@ body {
     min-width: 280px;
     max-width: 400px;
     width: 90%;
-    backdrop-filter: blur(10px);
+    backdrop-filter: blur(15px);
 }
 
 .timer-controls h1 {
-    color: #333;
+    color: white;
     font-size: 2rem;
     margin-bottom: 0.5rem;
+    text-shadow: 0 2px 10px rgba(0, 0, 0, 0.3);
 }
 
 .input-group {
@@ -65,8 +66,9 @@ body {
 
 .input-group label {
     font-size: 0.9rem;
-    color: #666;
+    color: rgba(255, 255, 255, 0.9);
     font-weight: 500;
+    text-shadow: 0 1px 5px rgba(0, 0, 0, 0.2);
 }
 
 .input-group input {
@@ -74,14 +76,21 @@ body {
     padding: 0.75rem;
     font-size: 1.5rem;
     text-align: center;
-    border: 2px solid #ddd;
+    border: 2px solid rgba(255, 255, 255, 0.3);
     border-radius: 10px;
     transition: border-color 0.3s;
+    background: rgba(255, 255, 255, 0.2);
+    color: white;
 }
 
 .input-group input:focus {
     outline: none;
-    border-color: #667eea;
+    border-color: rgba(255, 255, 255, 0.6);
+    background: rgba(255, 255, 255, 0.3);
+}
+
+.input-group input::placeholder {
+    color: rgba(255, 255, 255, 0.5);
 }
 
 .btn {
@@ -106,30 +115,32 @@ body {
 }
 
 .btn-secondary {
-    background: #f0f0f0;
-    color: #333;
+    background: rgba(255, 255, 255, 0.3);
+    color: white;
+    border: 1px solid rgba(255, 255, 255, 0.4);
 }
 
 .btn-secondary:hover {
-    background: #e0e0e0;
+    background: rgba(255, 255, 255, 0.4);
 }
 
 .timer-display {
     position: relative;
     z-index: 10;
-    background: rgba(255, 255, 255, 0.95);
+    background: linear-gradient(135deg, rgba(102, 126, 234, 0.75) 0%, rgba(118, 75, 162, 0.75) 100%);
     padding: 2rem;
     border-radius: 20px;
     box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
-    backdrop-filter: blur(10px);
+    backdrop-filter: blur(15px);
 }
 
 .time-text {
     font-size: 3rem;
     font-weight: bold;
-    color: #333;
+    color: white;
     font-variant-numeric: tabular-nums;
     text-align: center;
+    text-shadow: 0 2px 10px rgba(0, 0, 0, 0.3);
 }
 
 .completion-overlay {

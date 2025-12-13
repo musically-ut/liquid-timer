@@ -1,15 +1,49 @@
-// Water Simulation Engine
+// Water Simulation Engine (volume-conserving droplet accumulation + heightfield ripples)
 class WaterSimulation {
     constructor(canvas) {
         this.canvas = canvas;
         this.ctx = canvas.getContext('2d');
-        this.particles = [];
+
+        // Droplets: exist only while falling. When they hit the surface, they merge and are removed.
+        this.droplets = [];
+
+        // Conserved volume (2D cross-section volume, assuming unit depth)
+        this.waterVolume = 0;
         this.targetFillHeight = 0;
-        this.currentFillHeight = 0;
+        this.targetVolume = 0;
+        this.volumePerSecond = 0;
+
+        // Surface heightfield (1D) for ripples, stored as pixel offsets around the base surface.
+        this.surfaceN = 0;
+        this.h = [];
+        this.v = [];
+
+        // Emission control
+        // (We still simulate micro-droplets for volume conservation, but we render a continuous trickle.)
+        this.dropsPerSecond = 260; // higher => smoother/continuous stream
+        this.dropSpawnAccumulator = 0;
+        this.maxDroplets = 1400;
+
+        // Stream (visual) properties
+        this.streamX = 0;
+        this.streamWidth = 10; // px
+        this.streamWobbleAmp = 18; // px
+        this.streamWobbleSpeed = 0.65; // Hz-ish
+
+        // Physics parameters (pixel units, dt in seconds)
+        this.gravity = 5200; // px / s^2 (fast fall so arrival ~= emission)
+        this.airDrag = 0.995;
+        this.waveSpeed = 235; // px / s
+        this.waveDamping = 1.35; // 1 / s (lower => more visible ripples)
+        this.surfaceViscosity = 0.02;
+        this.renderWaveScale = 2.2; // purely visual boost so ripples read better
+
+        // Completion drain / whirlpool
         this.isDraining = false;
         this.whirlpoolActive = false;
         this.whirlpoolCenter = { x: 0, y: 0 };
         this.whirlpoolStrength = 0;
+        this.drainRate = 0;
 
         this.resize();
         window.addEventListener('resize', () => this.resize());
@@ -20,296 +54,475 @@ class WaterSimulation {
 
     resize() {
         const dpr = window.devicePixelRatio || 1;
-        this.canvas.width = window.innerWidth * dpr;
-        this.canvas.height = window.innerHeight * dpr;
-        this.canvas.style.width = window.innerWidth + 'px';
-        this.canvas.style.height = window.innerHeight + 'px';
+        const newWidth = window.innerWidth;
+        const newHeight = window.innerHeight;
+
+        // Preserve current heightfield to resample
+        const oldH = this.h;
+        const oldV = this.v;
+        const oldN = this.surfaceN;
+        const oldWidth = this.width || newWidth;
+
+        this.canvas.width = newWidth * dpr;
+        this.canvas.height = newHeight * dpr;
+        this.canvas.style.width = `${newWidth}px`;
+        this.canvas.style.height = `${newHeight}px`;
+
+        // IMPORTANT: reset transform before scaling (avoids compounding scale on resize)
+        this.ctx.setTransform(1, 0, 0, 1, 0, 0);
         this.ctx.scale(dpr, dpr);
 
-        this.width = window.innerWidth;
-        this.height = window.innerHeight;
+        this.width = newWidth;
+        this.height = newHeight;
 
-        // Adjust existing particles to new dimensions
-        this.particles.forEach(p => {
-            p.x = Math.min(p.x, this.width);
-            p.y = Math.min(p.y, this.height);
-        });
-    }
+        // Recompute target volume based on new cross-section area (unit depth)
+        if (this.targetFillHeight > 0) {
+            this.targetVolume = this.width * this.targetFillHeight;
+        }
 
-    addParticle(x, y) {
-        const particle = {
-            x: x || Math.random() * this.width,
-            y: y || -10,
-            vx: (Math.random() - 0.5) * 2,
-            vy: Math.random() * 3 + 2,
-            radius: Math.random() * 3 + 2,
-            mass: 1,
-            density: 0.02,
-            color: {
-                r: 100 + Math.random() * 50,
-                g: 150 + Math.random() * 50,
-                b: 255,
-                a: 0.6 + Math.random() * 0.3
-            }
-        };
-        this.particles.push(particle);
-    }
-
-    update(deltaTime, fillRate) {
-        // Add new particles based on fill rate
-        if (!this.isDraining && !this.whirlpoolActive) {
-            const particlesPerFrame = Math.max(1, fillRate * 0.3);
-            const particlesToAdd = Math.floor(particlesPerFrame) + (Math.random() < (particlesPerFrame % 1) ? 1 : 0);
-            for (let i = 0; i < particlesToAdd; i++) {
-                this.addParticle();
+        // Resample heightfield to match new resolution
+        this.initSurfaceField();
+        if (oldN > 0 && oldH.length === oldN) {
+            for (let i = 0; i < this.surfaceN; i++) {
+                const x = (i / (this.surfaceN - 1)) * (oldN - 1);
+                const i0 = Math.floor(x);
+                const i1 = Math.min(oldN - 1, i0 + 1);
+                const t = x - i0;
+                this.h[i] = (oldH[i0] ?? 0) * (1 - t) + (oldH[i1] ?? 0) * t;
+                this.v[i] = (oldV[i0] ?? 0) * (1 - t) + (oldV[i1] ?? 0) * t;
             }
         }
 
-        // Update particles
-        this.particles.forEach((particle, i) => {
-            // Apply gravity
-            particle.vy += 0.3 * deltaTime;
-
-            // Apply viscosity/damping
-            particle.vx *= 0.98;
-            particle.vy *= 0.98;
-
-            // Whirlpool effect
-            if (this.whirlpoolActive) {
-                const dx = particle.x - this.whirlpoolCenter.x;
-                const dy = particle.y - this.whirlpoolCenter.y;
-                const dist = Math.sqrt(dx * dx + dy * dy);
-                const angle = Math.atan2(dy, dx);
-                const force = this.whirlpoolStrength / (dist + 10);
-
-                particle.vx += Math.cos(angle + Math.PI / 2) * force * deltaTime * 50;
-                particle.vy += Math.sin(angle + Math.PI / 2) * force * deltaTime * 50;
-
-                // Pull towards center
-                particle.vx -= dx * force * deltaTime * 20;
-                particle.vy -= dy * force * deltaTime * 20;
-
-                // Increase downward velocity near center
-                if (dist < 50) {
-                    particle.vy += 5 * deltaTime;
-                }
-            }
-
-            // Update position with more realistic physics
-            const dt = deltaTime * 60;
-            particle.x += particle.vx * dt;
-            particle.y += particle.vy * dt;
-
-            // Boundary collisions
-            if (particle.x < particle.radius) {
-                particle.x = particle.radius;
-                particle.vx *= -0.5;
-            }
-            if (particle.x > this.width - particle.radius) {
-                particle.x = this.width - particle.radius;
-                particle.vx *= -0.5;
-            }
-
-            // Bottom boundary (water level)
-            const waterLevel = this.height - this.currentFillHeight;
-            if (particle.y > waterLevel - particle.radius) {
-                particle.y = waterLevel - particle.radius;
-                particle.vy *= -0.3;
-                particle.vx += (Math.random() - 0.5) * 0.5;
-            }
-
-            // Top boundary
-            if (particle.y < particle.radius) {
-                particle.y = particle.radius;
-                particle.vy *= -0.3;
-            }
-
-            // Particle interactions (realistic fluid dynamics)
-            const nearbyParticles = this.particles.slice(i + 1).filter(other => {
-                const dx = other.x - particle.x;
-                const dy = other.y - particle.y;
-                return (dx * dx + dy * dy) < 400; // Only check nearby particles
-            });
-
-            nearbyParticles.forEach(other => {
-                const dx = other.x - particle.x;
-                const dy = other.y - particle.y;
-                const dist = Math.sqrt(dx * dx + dy * dy);
-                const minDist = particle.radius + other.radius;
-
-                if (dist < minDist && dist > 0) {
-                    const angle = Math.atan2(dy, dx);
-                    const overlap = minDist - dist;
-
-                    // Separate particles with realistic pressure
-                    const moveX = Math.cos(angle) * overlap * 0.5;
-                    const moveY = Math.sin(angle) * overlap * 0.5;
-                    particle.x -= moveX;
-                    particle.y -= moveY;
-                    other.x += moveX;
-                    other.y += moveY;
-
-                    // Realistic momentum transfer (conservation of momentum)
-                    const vx1 = particle.vx;
-                    const vy1 = particle.vy;
-                    const vx2 = other.vx;
-                    const vy2 = other.vy;
-
-                    // Elastic collision with damping
-                    const relativeVx = vx2 - vx1;
-                    const relativeVy = vy2 - vy1;
-                    const dotProduct = relativeVx * Math.cos(angle) + relativeVy * Math.sin(angle);
-
-                    if (dotProduct < 0) {
-                        const impulse = dotProduct * 0.4; // Damping factor
-                        particle.vx += impulse * Math.cos(angle);
-                        particle.vy += impulse * Math.sin(angle);
-                        other.vx -= impulse * Math.cos(angle);
-                        other.vy -= impulse * Math.sin(angle);
-                    }
-                } else if (dist < minDist * 3 && dist > 0) {
-                    // Surface tension effect for nearby particles
-                    const tension = 0.01;
-                    const force = tension / (dist * dist);
-                    particle.vx += (dx / dist) * force;
-                    particle.vy += (dy / dist) * force;
-                }
-            });
+        // Keep droplets within bounds (don’t “stretch” them)
+        const sx = this.width / Math.max(1, oldWidth);
+        this.droplets.forEach(d => {
+            d.x *= sx;
+            d.x = Math.max(d.r, Math.min(this.width - d.r, d.x));
         });
 
-        // Remove particles that are off-screen or drained
-        this.particles = this.particles.filter(p => {
-            if (this.whirlpoolActive && p.y > this.height + 50) {
-                return false;
-            }
-            return p.y < this.height + 100 && p.x > -100 && p.x < this.width + 100;
+        // Reset stream X to center-ish on resize/orientation changes
+        this.streamX = this.width * 0.55;
+    }
+
+    initSurfaceField() {
+        const n = Math.max(96, Math.floor(this.width / 3));
+        this.surfaceN = n;
+        this.h = new Array(n).fill(0);
+        this.v = new Array(n).fill(0);
+    }
+
+    setTargetFillHeight(height) {
+        this.targetFillHeight = height;
+        this.targetVolume = this.width * height;
+    }
+
+    setEmission(volumePerSecond) {
+        this.volumePerSecond = Math.max(0, volumePerSecond);
+    }
+
+    reset() {
+        this.droplets = [];
+        this.waterVolume = 0;
+        this.dropSpawnAccumulator = 0;
+        this.h.fill(0);
+        this.v.fill(0);
+        this.isDraining = false;
+        this.whirlpoolActive = false;
+        this.whirlpoolStrength = 0;
+        this.drainRate = 0;
+    }
+
+    getWaterHeight() {
+        // volume = width * height (unit depth)
+        if (this.width <= 0) return 0;
+        return Math.min(this.targetFillHeight || this.height, this.waterVolume / this.width);
+    }
+
+    getBaseSurfaceY() {
+        return this.height - this.getWaterHeight();
+    }
+
+    xToIndex(x) {
+        const t = this.width <= 1 ? 0 : x / this.width;
+        return Math.max(0, Math.min(this.surfaceN - 1, Math.floor(t * (this.surfaceN - 1))));
+    }
+
+    sampleSurfaceOffset(x) {
+        if (this.surfaceN <= 1) return 0;
+        const fx = (x / this.width) * (this.surfaceN - 1);
+        const i0 = Math.floor(fx);
+        const i1 = Math.min(this.surfaceN - 1, i0 + 1);
+        const t = fx - i0;
+        return (this.h[i0] ?? 0) * (1 - t) + (this.h[i1] ?? 0) * t;
+    }
+
+    getSurfaceY(x) {
+        return this.getBaseSurfaceY() + this.sampleSurfaceOffset(x);
+    }
+
+    addRippleImpulse(x, strength) {
+        // strength affects velocity directly (px/s)
+        const idx = this.xToIndex(x);
+        const s = strength;
+        if (this.v[idx] !== undefined) this.v[idx] += s;
+        if (this.v[idx - 1] !== undefined) this.v[idx - 1] += s * 0.75;
+        if (this.v[idx + 1] !== undefined) this.v[idx + 1] += s * 0.75;
+        if (this.v[idx - 2] !== undefined) this.v[idx - 2] += s * 0.45;
+        if (this.v[idx + 2] !== undefined) this.v[idx + 2] += s * 0.45;
+        if (this.v[idx - 3] !== undefined) this.v[idx - 3] += s * 0.20;
+        if (this.v[idx + 3] !== undefined) this.v[idx + 3] += s * 0.20;
+    }
+
+    spawnDroplet() {
+        if (this.droplets.length >= this.maxDroplets) return;
+
+        const meanDropVolume = this.volumePerSecond / Math.max(1, this.dropsPerSecond);
+        // Variation around mean (keep positive)
+        const vol = Math.max(0.0001, meanDropVolume * (0.65 + Math.random() * 0.7));
+
+        // Convert "2D volume" into a visual radius. Clamp so drops are visible but not huge.
+        // This is purely visual — conservation is handled via `vol`.
+        const r = Math.max(1.5, Math.min(5.5, Math.sqrt(vol / Math.PI) * 9.5));
+
+        // Spawn around the stream center so it reads as a trickle (not scattered drops).
+        // Slight jitter prevents it looking like a rigid rod.
+        const jitter = (Math.random() - 0.5) * this.streamWidth * 0.9;
+        const x = Math.max(0, Math.min(this.width, this.streamX + jitter));
+        const y = -12 - Math.random() * 40;
+        const vx = (Math.random() - 0.5) * 20;
+        const vy = 0;
+
+        this.droplets.push({
+            x,
+            y,
+            px: x,
+            py: y,
+            vx,
+            vy,
+            r,
+            vol
         });
+    }
 
-        // Update fill height based on time and particle accumulation
-        if (!this.isDraining && !this.whirlpoolActive && fillRate > 0) {
-            // Use time-based fill for smooth progression
-            this.currentFillHeight = Math.min(this.currentFillHeight + fillRate * deltaTime * 60, this.targetFillHeight);
+    stepSurface(dt) {
+        if (this.surfaceN <= 2) return;
+        const dx = this.width / (this.surfaceN - 1);
+        const c2 = this.waveSpeed * this.waveSpeed;
 
-            // Also consider particle accumulation for visual feedback
-            const waterLevel = this.height - this.currentFillHeight;
-            const particlesBelowWater = this.particles.filter(p => p.y >= waterLevel).length;
-            // Ensure we have enough particles to represent the water level
-            if (particlesBelowWater < 100 && this.currentFillHeight < this.targetFillHeight) {
-                // Add extra particles if needed
-                for (let i = 0; i < 5; i++) {
-                    this.addParticle(Math.random() * this.width, waterLevel - Math.random() * 20);
-                }
+        // Wave equation: h'' = c^2 * laplacian(h)
+        for (let i = 1; i < this.surfaceN - 1; i++) {
+            const lap = (this.h[i - 1] + this.h[i + 1] - 2 * this.h[i]) / (dx * dx);
+            this.v[i] += c2 * lap * dt;
+        }
+
+        // Damping + integrate
+        const damp = Math.exp(-this.waveDamping * dt);
+        for (let i = 0; i < this.surfaceN; i++) {
+            this.v[i] *= damp;
+            this.h[i] += this.v[i] * dt;
+        }
+
+        // Light viscosity / smoothing
+        if (this.surfaceViscosity > 0) {
+            const tmp = new Array(this.surfaceN);
+            tmp[0] = this.h[0];
+            tmp[this.surfaceN - 1] = this.h[this.surfaceN - 1];
+            const a = this.surfaceViscosity;
+            for (let i = 1; i < this.surfaceN - 1; i++) {
+                tmp[i] = this.h[i] * (1 - a) + (this.h[i - 1] + this.h[i + 1]) * (a * 0.5);
             }
+            this.h = tmp;
+        }
+    }
+
+    update(deltaTime) {
+        const dt = Math.max(0, Math.min(0.05, deltaTime)); // clamp large frame jumps
+
+        // Update stream X with a gentle wobble (feels like a trickle)
+        const t = performance.now() * 0.001;
+        const base = this.width * 0.56;
+        const wobble = Math.sin(t * (Math.PI * 2) * this.streamWobbleSpeed) * this.streamWobbleAmp;
+        const wobble2 = Math.sin(t * (Math.PI * 2) * (this.streamWobbleSpeed * 1.9) + 1.3) * (this.streamWobbleAmp * 0.35);
+        this.streamX = Math.max(this.streamWidth, Math.min(this.width - this.streamWidth, base + wobble + wobble2));
+
+        // Emit droplets at a fixed *count* rate; each droplet carries a volume so that
+        // total incoming volume per second is `volumePerSecond`.
+        if (!this.isDraining && !this.whirlpoolActive && this.volumePerSecond > 0) {
+            this.dropSpawnAccumulator += this.dropsPerSecond * dt;
+            while (this.dropSpawnAccumulator >= 1) {
+                this.spawnDroplet();
+                this.dropSpawnAccumulator -= 1;
+            }
+        }
+
+        // Drain volume during completion
+        if (this.isDraining && this.drainRate > 0) {
+            this.waterVolume = Math.max(0, this.waterVolume - this.drainRate * dt);
+            this.whirlpoolStrength = Math.min(3.5, this.whirlpoolStrength + dt * 0.9);
+        }
+
+        const baseSurfaceY = this.getBaseSurfaceY();
+
+        // Update droplets (free-fall) and merge on impact
+        for (let i = this.droplets.length - 1; i >= 0; i--) {
+            const d = this.droplets[i];
+            d.px = d.x;
+            d.py = d.y;
+
+            d.vy += this.gravity * dt;
+            d.vx *= this.airDrag;
+            d.vy *= this.airDrag;
+
+            d.x += d.vx * dt;
+            d.y += d.vy * dt;
+
+            // Side boundaries
+            if (d.x < d.r) {
+                d.x = d.r;
+                d.vx *= -0.35;
+            } else if (d.x > this.width - d.r) {
+                d.x = this.width - d.r;
+                d.vx *= -0.35;
+            }
+
+            // Impact with surface
+            const surfaceY = this.getSurfaceY(d.x);
+            if (d.y + d.r >= surfaceY) {
+                // Volume conservation: only add to reservoir when the droplet hits the surface.
+                this.waterVolume = Math.min(this.targetVolume || Infinity, this.waterVolume + d.vol);
+
+                // Inject a ripple impulse proportional to impact speed and droplet volume.
+                const impulse = Math.min(6500, (d.vy * 1.25 + d.vol * 220));
+                this.addRippleImpulse(d.x, impulse);
+
+                // Remove droplet (no lingering traces)
+                this.droplets.splice(i, 1);
+            } else if (d.y > this.height + 120) {
+                // Safety: if it somehow falls through, drop it.
+                this.droplets.splice(i, 1);
+            }
+        }
+
+        // Apply whirlpool "sink" to the surface during drain (creates a visible draw-down)
+        if (this.whirlpoolActive) {
+            const cx = this.whirlpoolCenter.x;
+            const idx = this.xToIndex(cx);
+            const sigma = 9; // indices
+            const sink = -1600 * this.whirlpoolStrength;
+            for (let k = -28; k <= 28; k++) {
+                const j = idx + k;
+                if (j < 0 || j >= this.surfaceN) continue;
+                const w = Math.exp(-(k * k) / (2 * sigma * sigma));
+                this.v[j] += sink * w * dt;
+            }
+        }
+
+        // Keep base surface stable (don’t let ripples float above top)
+        if (baseSurfaceY < 0) {
+            this.waterVolume = this.width * this.height;
+        }
+
+        // Step ripples
+        this.stepSurface(dt);
+
+        // Auto-stop drain once empty
+        if (this.isDraining && this.waterVolume <= 0 && this.droplets.length === 0) {
+            this.whirlpoolActive = false;
+            this.isDraining = false;
+            this.whirlpoolStrength = 0;
+            this.drainRate = 0;
         }
     }
 
     render() {
-        // Clear with gradient background
-        const gradient = this.ctx.createLinearGradient(0, 0, 0, this.height);
-        gradient.addColorStop(0, 'rgba(102, 126, 234, 0.1)');
-        gradient.addColorStop(1, 'rgba(118, 75, 162, 0.1)');
-        this.ctx.fillStyle = gradient;
+        // Background
+        const bg = this.ctx.createLinearGradient(0, 0, 0, this.height);
+        bg.addColorStop(0, 'rgba(102, 126, 234, 0.10)');
+        bg.addColorStop(1, 'rgba(118, 75, 162, 0.10)');
+        this.ctx.fillStyle = bg;
         this.ctx.fillRect(0, 0, this.width, this.height);
 
-        // Calculate water level
-        const waterLevel = this.height - this.currentFillHeight;
+        const waterHeight = this.getWaterHeight();
+        const baseSurfaceY = this.getBaseSurfaceY();
 
-        // Draw water surface with realistic rendering
-        if (this.currentFillHeight > 0) {
-            // Draw water body with depth-based opacity
-            const waterGradient = this.ctx.createLinearGradient(0, waterLevel, 0, this.height);
-            waterGradient.addColorStop(0, 'rgba(100, 150, 255, 0.85)');
-            waterGradient.addColorStop(0.3, 'rgba(80, 130, 240, 0.9)');
-            waterGradient.addColorStop(0.7, 'rgba(60, 110, 220, 0.92)');
-            waterGradient.addColorStop(1, 'rgba(40, 90, 200, 0.95)');
+        // Water body
+        if (waterHeight > 0.5) {
+            const waterGradient = this.ctx.createLinearGradient(0, baseSurfaceY, 0, this.height);
+            waterGradient.addColorStop(0, 'rgba(120, 175, 255, 0.78)');
+            waterGradient.addColorStop(0.35, 'rgba(85, 145, 245, 0.86)');
+            waterGradient.addColorStop(1, 'rgba(45, 95, 210, 0.95)');
 
+            // Build surface path once so we can reuse it for clip + strokes
+            this.ctx.beginPath();
+            this.ctx.moveTo(0, this.height);
+            this.ctx.lineTo(0, baseSurfaceY + ((this.h[0] ?? 0) * this.renderWaveScale));
+            for (let i = 1; i < this.surfaceN; i++) {
+                const x = (i / (this.surfaceN - 1)) * this.width;
+                this.ctx.lineTo(x, baseSurfaceY + (this.h[i] * this.renderWaveScale));
+            }
+            this.ctx.lineTo(this.width, this.height);
+            this.ctx.closePath();
             this.ctx.fillStyle = waterGradient;
-            this.ctx.fillRect(0, waterLevel, this.width, this.currentFillHeight);
+            this.ctx.fill();
 
-            // Draw surface line with animated waves and reflections
-            this.ctx.strokeStyle = 'rgba(150, 200, 255, 0.7)';
-            this.ctx.lineWidth = 2;
+            // Lighting (fake 3D): clip to water and overlay a diagonal "sun" gradient from top-right
+            this.ctx.save();
+            this.ctx.clip();
+            this.ctx.globalCompositeOperation = 'lighter';
+            const sun = this.ctx.createLinearGradient(this.width * 1.05, 0, 0, this.height * 0.9);
+            sun.addColorStop(0, 'rgba(255,255,255,0.18)');
+            sun.addColorStop(0.25, 'rgba(255,255,255,0.06)');
+            sun.addColorStop(1, 'rgba(255,255,255,0.00)');
+            this.ctx.fillStyle = sun;
+            this.ctx.fillRect(0, 0, this.width, this.height);
+            this.ctx.restore();
+
+            // Surface specular that follows the wave crest (removes the "white band" artifact)
+            const spec = this.ctx.createLinearGradient(0, baseSurfaceY - 40, 0, baseSurfaceY + 60);
+            spec.addColorStop(0, 'rgba(255,255,255,0.00)');
+            spec.addColorStop(0.45, 'rgba(255,255,255,0.22)');
+            spec.addColorStop(1, 'rgba(255,255,255,0.00)');
+            this.ctx.strokeStyle = spec;
+            this.ctx.lineWidth = 2.2;
             this.ctx.beginPath();
-            this.ctx.moveTo(0, waterLevel);
-
-            const time = Date.now() * 0.001;
-            // Create more complex wavy surface
-            for (let x = 0; x < this.width; x += 3) {
-                const wave1 = Math.sin(x * 0.015 + time) * 1.5;
-                const wave2 = Math.sin(x * 0.03 + time * 1.3) * 0.8;
-                const wave3 = Math.sin(x * 0.05 + time * 0.7) * 0.5;
-                const wave = wave1 + wave2 + wave3;
-                this.ctx.lineTo(x, waterLevel + wave);
+            this.ctx.moveTo(0, baseSurfaceY + ((this.h[0] ?? 0) * this.renderWaveScale));
+            for (let i = 1; i < this.surfaceN; i++) {
+                const x = (i / (this.surfaceN - 1)) * this.width;
+                this.ctx.lineTo(x, baseSurfaceY + (this.h[i] * this.renderWaveScale));
             }
             this.ctx.stroke();
 
-            // Add surface highlights
-            this.ctx.fillStyle = 'rgba(200, 230, 255, 0.3)';
+            // Surface line (thin)
+            this.ctx.strokeStyle = 'rgba(190, 230, 255, 0.65)';
+            this.ctx.lineWidth = 1.6;
             this.ctx.beginPath();
-            for (let x = 0; x < this.width; x += 20) {
-                const wave = Math.sin(x * 0.02 + time) * 2;
-                this.ctx.fillRect(x, waterLevel + wave - 1, 15, 2);
+            this.ctx.moveTo(0, baseSurfaceY + ((this.h[0] ?? 0) * this.renderWaveScale));
+            for (let i = 1; i < this.surfaceN; i++) {
+                const x = (i / (this.surfaceN - 1)) * this.width;
+                this.ctx.lineTo(x, baseSurfaceY + (this.h[i] * this.renderWaveScale));
             }
+            this.ctx.stroke();
         }
 
-        // Draw particles with realistic rendering
-        this.particles.forEach(particle => {
-            // Create gradient for particle
-            const particleGradient = this.ctx.createRadialGradient(
-                particle.x, particle.y, 0,
-                particle.x, particle.y, particle.radius
-            );
-            particleGradient.addColorStop(0, `rgba(${particle.color.r}, ${particle.color.g}, ${particle.color.b}, ${particle.color.a})`);
-            particleGradient.addColorStop(0.7, `rgba(${particle.color.r - 20}, ${particle.color.g - 20}, ${particle.color.b}, ${particle.color.a * 0.8})`);
-            particleGradient.addColorStop(1, `rgba(${particle.color.r - 40}, ${particle.color.g - 40}, ${particle.color.b - 20}, ${particle.color.a * 0.4})`);
+        // Falling water: render as a continuous trickle stream (no discrete droplet circles)
+        this.renderStream();
 
-            this.ctx.fillStyle = particleGradient;
-            this.ctx.beginPath();
-            this.ctx.arc(particle.x, particle.y, particle.radius, 0, Math.PI * 2);
-            this.ctx.fill();
-
-            // Add highlight
-            this.ctx.fillStyle = `rgba(255, 255, 255, ${particle.color.a * 0.3})`;
-            this.ctx.beginPath();
-            this.ctx.arc(particle.x - particle.radius * 0.3, particle.y - particle.radius * 0.3, particle.radius * 0.4, 0, Math.PI * 2);
-            this.ctx.fill();
-        });
-
-        // Draw whirlpool visualization
+        // Whirlpool visualization
         if (this.whirlpoolActive) {
-            const centerX = this.whirlpoolCenter.x;
-            const centerY = this.whirlpoolCenter.y;
+            const cx = this.whirlpoolCenter.x;
+            const cy = this.whirlpoolCenter.y;
+            const t = Date.now() * 0.002;
+            this.ctx.save();
+            this.ctx.globalCompositeOperation = 'lighter';
 
-            // Draw spiral
-            this.ctx.strokeStyle = 'rgba(100, 150, 255, 0.6)';
+            // Funnel "hole" with radial gradient (fake depth)
+            const holeR = 34 + this.whirlpoolStrength * 12;
+            const hole = this.ctx.createRadialGradient(cx - 10, cy - 10, 2, cx, cy, holeR);
+            hole.addColorStop(0, 'rgba(10, 35, 80, 0.85)');
+            hole.addColorStop(0.35, 'rgba(40, 90, 170, 0.35)');
+            hole.addColorStop(1, 'rgba(140, 210, 255, 0.00)');
+            this.ctx.fillStyle = hole;
+            this.ctx.beginPath();
+            this.ctx.ellipse(cx, cy, holeR * 1.05, holeR * 0.72, 0, 0, Math.PI * 2);
+            this.ctx.fill();
+
+            // Spiral lines for motion
+            this.ctx.strokeStyle = 'rgba(170, 230, 255, 0.55)';
             this.ctx.lineWidth = 2;
             this.ctx.beginPath();
-            for (let angle = 0; angle < Math.PI * 8; angle += 0.1) {
-                const radius = angle * 2;
-                const x = centerX + Math.cos(angle + Date.now() * 0.005) * radius;
-                const y = centerY + Math.sin(angle + Date.now() * 0.005) * radius;
-                if (angle === 0) {
-                    this.ctx.moveTo(x, y);
-                } else {
-                    this.ctx.lineTo(x, y);
-                }
+            for (let a = 0; a < Math.PI * 11; a += 0.07) {
+                const r = 6 + a * 3.8;
+                const x = cx + Math.cos(a + t) * r;
+                const y = cy + Math.sin(a + t) * r * 0.62;
+                if (a === 0) this.ctx.moveTo(x, y);
+                else this.ctx.lineTo(x, y);
             }
             this.ctx.stroke();
+            this.ctx.restore();
         }
+    }
+
+    renderStream() {
+        if (this.volumePerSecond <= 0 && !this.isDraining) return;
+
+        const x = this.streamX;
+        const surfaceY = this.getSurfaceY(x);
+        const waterHeight = this.getWaterHeight();
+
+        if (!Number.isFinite(x) || !Number.isFinite(surfaceY)) return;
+
+        // Compute a plausible end point (if there are droplets, use the lowest one)
+        let endY = Math.min(surfaceY - 2, this.height);
+        if (this.droplets.length > 0) {
+            let maxY = -Infinity;
+            for (const d of this.droplets) {
+                if (d.y > maxY) maxY = d.y;
+            }
+            endY = Math.min(surfaceY - 2, Math.max(0, maxY));
+        }
+
+        // Guard against non-finite geometry
+        if (!Number.isFinite(endY)) return;
+        endY = Math.max(-50, Math.min(this.height, endY));
+
+        const t = performance.now() * 0.001;
+        const w = this.streamWidth * (0.85 + 0.25 * Math.sin(t * 2.1));
+        const wob = Math.sin(t * 3.0) * (this.streamWidth * 0.35);
+
+        if (!Number.isFinite(w) || w <= 0) return;
+
+        // Main body (a ribbon with gradient)
+        this.ctx.save();
+        this.ctx.globalCompositeOperation = 'lighter';
+        const grad = this.ctx.createLinearGradient(x, 0, x, endY);
+        grad.addColorStop(0, 'rgba(210, 245, 255, 0.06)');
+        grad.addColorStop(0.20, 'rgba(160, 220, 255, 0.18)');
+        grad.addColorStop(1, 'rgba(120, 190, 255, 0.10)');
+
+        this.ctx.strokeStyle = grad;
+        this.ctx.lineWidth = w;
+        this.ctx.lineCap = 'round';
+
+        this.ctx.beginPath();
+        this.ctx.moveTo(x + wob * 0.10, -10);
+        this.ctx.quadraticCurveTo(
+            x + wob * 0.55,
+            endY * 0.35,
+            x - wob * 0.35,
+            endY * 0.72
+        );
+        this.ctx.quadraticCurveTo(x + wob * 0.25, endY * 0.90, x, endY);
+        this.ctx.stroke();
+
+        // Specular thread inside the stream
+        this.ctx.strokeStyle = 'rgba(255,255,255,0.14)';
+        this.ctx.lineWidth = Math.max(1.2, w * 0.22);
+        this.ctx.beginPath();
+        this.ctx.moveTo(x - w * 0.15, -10);
+        this.ctx.quadraticCurveTo(x + wob * 0.35, endY * 0.45, x - w * 0.10, endY);
+        this.ctx.stroke();
+
+        // Small splash brightness at impact
+        if (endY > 10 && waterHeight > 0.5) {
+            const splash = this.ctx.createRadialGradient(x, surfaceY, 1, x, surfaceY, 28);
+            splash.addColorStop(0, 'rgba(255,255,255,0.18)');
+            splash.addColorStop(1, 'rgba(255,255,255,0.00)');
+            this.ctx.fillStyle = splash;
+            this.ctx.beginPath();
+            this.ctx.ellipse(x, surfaceY, 26, 10, 0, 0, Math.PI * 2);
+            this.ctx.fill();
+        }
+
+        this.ctx.restore();
     }
 
     startDraining() {
         this.isDraining = true;
         this.whirlpoolActive = true;
-        this.whirlpoolCenter = {
-            x: this.width / 2,
-            y: this.height - 50
-        };
-        this.whirlpoolStrength = 0.5;
-    }
-
-    setTargetFillHeight(height) {
-        this.targetFillHeight = height;
+        this.whirlpoolCenter = { x: this.width / 2, y: this.height - 50 };
+        this.whirlpoolStrength = 0.6;
+        // Drain out over ~2.5 seconds (tuned)
+        this.drainRate = this.waterVolume / 2.2;
     }
 }
 
@@ -401,11 +614,11 @@ class TimerController {
         this.isRunning = true;
         this.isPaused = false;
 
-        // Calculate target fill height (full screen height)
+        // Target: fill the full screen height by the end (volume-conserving)
         const targetHeight = window.innerHeight;
         this.waterSim.setTargetFillHeight(targetHeight);
-        this.waterSim.currentFillHeight = 0;
-        this.waterSim.particles = [];
+        this.waterSim.reset();
+        this.waterSim.setEmission(this.waterSim.targetVolume / this.totalSeconds);
 
         // Show/hide UI elements
         this.timerControls.style.display = 'none';
@@ -437,11 +650,7 @@ class TimerController {
             this.intervalId = null;
         }
 
-        this.waterSim.particles = [];
-        this.waterSim.currentFillHeight = 0;
-        this.waterSim.isDraining = false;
-        this.waterSim.whirlpoolActive = false;
-        this.waterSim.whirlpoolStrength = 0;
+        this.waterSim.reset();
 
         this.timerControls.style.display = 'flex';
         this.timerDisplay.style.display = 'none';
@@ -470,19 +679,23 @@ class TimerController {
                 return;
             }
 
-            // Calculate fill rate (pixels per second)
-            const fillRate = (this.waterSim.targetFillHeight / this.totalSeconds) * (deltaTime / deltaTime);
-            const actualFillRate = this.waterSim.targetFillHeight / this.totalSeconds;
-
-            // Update water simulation
-            this.waterSim.update(deltaTime, actualFillRate);
+            // Update water simulation (guard to avoid a render-time exception freezing the timer)
+            try {
+                this.waterSim.update(deltaTime);
+            } catch (err) {
+                console.error('Water simulation update failed:', err);
+            }
 
             // Update display
             this.timeText.textContent = this.formatTime(Math.ceil(this.remainingSeconds));
         }
 
         // Render
-        this.waterSim.render();
+        try {
+            this.waterSim.render();
+        } catch (err) {
+            console.error('Water render failed:', err);
+        }
 
         this.intervalId = requestAnimationFrame(() => this.animate());
     }
@@ -571,16 +784,16 @@ class TimerController {
         this.playCompletionSound();
 
         // Continue animation for draining
+        let last = performance.now();
         const drainAnimation = () => {
-            if (this.waterSim.currentFillHeight > 0 || this.waterSim.particles.length > 0) {
-                this.waterSim.currentFillHeight = Math.max(0, this.waterSim.currentFillHeight - 8);
-                this.waterSim.whirlpoolStrength = Math.min(this.waterSim.whirlpoolStrength + 0.02, 3);
-                this.waterSim.update(0.016, 0);
+            const now = performance.now();
+            const dt = (now - last) / 1000;
+            last = now;
+            if (this.waterSim.isDraining || this.waterSim.whirlpoolActive) {
+                this.waterSim.update(dt);
                 this.waterSim.render();
                 requestAnimationFrame(drainAnimation);
             } else {
-                this.waterSim.whirlpoolActive = false;
-                this.waterSim.isDraining = false;
                 this.releaseWakeLock();
             }
         };
