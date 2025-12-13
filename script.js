@@ -20,9 +20,9 @@ class WaterSimulation {
 
         // Emission control
         // (We still simulate micro-droplets for volume conservation, but we render a continuous trickle.)
-        this.dropsPerSecond = 260; // higher => smoother/continuous stream
+        this.dropsPerSecond = 150; // tuned for smoother stream
         this.dropSpawnAccumulator = 0;
-        this.maxDroplets = 1400;
+        this.maxDroplets = 900;
 
         // Stream (visual) properties
         this.streamX = 0;
@@ -31,12 +31,13 @@ class WaterSimulation {
         this.streamWobbleSpeed = 0.65; // Hz-ish
 
         // Physics parameters (pixel units, dt in seconds)
-        this.gravity = 5200; // px / s^2 (fast fall so arrival ~= emission)
+        this.gravity = 3000; // px / s^2 (safer)
         this.airDrag = 0.995;
-        this.waveSpeed = 235; // px / s
-        this.waveDamping = 1.35; // 1 / s (lower => more visible ripples)
-        this.surfaceViscosity = 0.02;
-        this.renderWaveScale = 2.2; // purely visual boost so ripples read better
+        this.waveSpeed = 160; // px / s
+        this.waveDamping = 2.2; // damping
+        this.surfaceViscosity = 0.07; // smoother surface
+        this.renderWaveScale = 1.0; // modest visual lift
+        this.maxWaveDisplacement = 40; // clamp to avoid big lobes
 
         // Completion drain / whirlpool
         this.isDraining = false;
@@ -153,7 +154,8 @@ class WaterSimulation {
         const i0 = Math.floor(fx);
         const i1 = Math.min(this.surfaceN - 1, i0 + 1);
         const t = fx - i0;
-        return (this.h[i0] ?? 0) * (1 - t) + (this.h[i1] ?? 0) * t;
+        const v = (this.h[i0] ?? 0) * (1 - t) + (this.h[i1] ?? 0) * t;
+        return Math.max(-this.maxWaveDisplacement, Math.min(this.maxWaveDisplacement, v));
     }
 
     getSurfaceY(x) {
@@ -164,13 +166,14 @@ class WaterSimulation {
         // strength affects velocity directly (px/s)
         const idx = this.xToIndex(x);
         const s = strength;
+        const jitter = () => (Math.random() - 0.5) * s * 0.05;
         if (this.v[idx] !== undefined) this.v[idx] += s;
-        if (this.v[idx - 1] !== undefined) this.v[idx - 1] += s * 0.75;
-        if (this.v[idx + 1] !== undefined) this.v[idx + 1] += s * 0.75;
-        if (this.v[idx - 2] !== undefined) this.v[idx - 2] += s * 0.45;
-        if (this.v[idx + 2] !== undefined) this.v[idx + 2] += s * 0.45;
-        if (this.v[idx - 3] !== undefined) this.v[idx - 3] += s * 0.20;
-        if (this.v[idx + 3] !== undefined) this.v[idx + 3] += s * 0.20;
+        if (this.v[idx - 1] !== undefined) this.v[idx - 1] += s * 0.65 + jitter();
+        if (this.v[idx + 1] !== undefined) this.v[idx + 1] += s * 0.65 + jitter();
+        if (this.v[idx - 2] !== undefined) this.v[idx - 2] += s * 0.35 + jitter();
+        if (this.v[idx + 2] !== undefined) this.v[idx + 2] += s * 0.35 + jitter();
+        if (this.v[idx - 3] !== undefined) this.v[idx - 3] += s * 0.15 + jitter();
+        if (this.v[idx + 3] !== undefined) this.v[idx + 3] += s * 0.15 + jitter();
     }
 
     spawnDroplet() {
@@ -215,11 +218,20 @@ class WaterSimulation {
             this.v[i] += c2 * lap * dt;
         }
 
+        // Add a mild dispersion term (higher-order smoothing) for richer interference
+        const disp = 0.12;
+        for (let i = 2; i < this.surfaceN - 2; i++) {
+            const lap2 = this.h[i - 2] - 4 * this.h[i - 1] + 6 * this.h[i] - 4 * this.h[i + 1] + this.h[i + 2];
+            this.v[i] += disp * lap2 * dt;
+        }
+
         // Damping + integrate
         const damp = Math.exp(-this.waveDamping * dt);
         for (let i = 0; i < this.surfaceN; i++) {
             this.v[i] *= damp;
             this.h[i] += this.v[i] * dt;
+            // Clamp to avoid NaN/amplification
+            this.h[i] = Math.max(-this.maxWaveDisplacement, Math.min(this.maxWaveDisplacement, this.h[i]));
         }
 
         // Light viscosity / smoothing
@@ -233,6 +245,12 @@ class WaterSimulation {
             }
             this.h = tmp;
         }
+
+        // Reflective boundary conditions (energy bounce at walls)
+        this.h[0] = this.h[1] * 0.9;
+        this.h[this.surfaceN - 1] = this.h[this.surfaceN - 2] * 0.9;
+        this.v[0] = -this.v[1] * 0.65;
+        this.v[this.surfaceN - 1] = -this.v[this.surfaceN - 2] * 0.65;
     }
 
     update(deltaTime) {
@@ -287,23 +305,29 @@ class WaterSimulation {
 
             // Impact with surface
             const surfaceY = this.getSurfaceY(d.x);
+            if (!Number.isFinite(surfaceY)) {
+                // Safety: drop the droplet to avoid NaNs
+                this.droplets.splice(i, 1);
+                continue;
+            }
             if (d.y + d.r >= surfaceY) {
                 // Volume conservation: only add to reservoir when the droplet hits the surface.
                 this.waterVolume = Math.min(this.targetVolume || Infinity, this.waterVolume + d.vol);
 
                 // Inject a ripple impulse proportional to impact speed and droplet volume.
-                const impulse = Math.min(6500, (d.vy * 1.25 + d.vol * 220));
+                const impulse = Math.min(3200, (d.vy * 0.9 + d.vol * 150));
                 this.addRippleImpulse(d.x, impulse);
 
                 // Remove droplet (no lingering traces)
                 this.droplets.splice(i, 1);
-            } else if (d.y > this.height + 120) {
-                // Safety: if it somehow falls through, drop it.
+            } else if (d.y > this.height + 40) {
+                // Fallback: if it somehow falls through, count its volume and remove
+                this.waterVolume = Math.min(this.targetVolume || Infinity, this.waterVolume + d.vol * 0.6);
                 this.droplets.splice(i, 1);
             }
         }
 
-        // Apply whirlpool "sink" to the surface during drain (creates a visible draw-down)
+        // Apply whirlpool "sink" to the surface during drain (creates a draw-down; visuals optional)
         if (this.whirlpoolActive) {
             const cx = this.whirlpoolCenter.x;
             const idx = this.xToIndex(cx);
@@ -343,7 +367,10 @@ class WaterSimulation {
         this.ctx.fillRect(0, 0, this.width, this.height);
 
         const waterHeight = this.getWaterHeight();
-        const baseSurfaceY = this.getBaseSurfaceY();
+        let baseSurfaceY = this.getBaseSurfaceY();
+        if (!Number.isFinite(waterHeight) || !Number.isFinite(baseSurfaceY)) return;
+        baseSurfaceY = Math.max(0, Math.min(this.height, baseSurfaceY));
+        if (!Number.isFinite(waterHeight) || !Number.isFinite(baseSurfaceY)) return;
 
         // Water body
         if (waterHeight > 0.5) {
@@ -407,39 +434,7 @@ class WaterSimulation {
         // Falling water: render as a continuous trickle stream (no discrete droplet circles)
         this.renderStream();
 
-        // Whirlpool visualization
-        if (this.whirlpoolActive) {
-            const cx = this.whirlpoolCenter.x;
-            const cy = this.whirlpoolCenter.y;
-            const t = Date.now() * 0.002;
-            this.ctx.save();
-            this.ctx.globalCompositeOperation = 'lighter';
-
-            // Funnel "hole" with radial gradient (fake depth)
-            const holeR = 34 + this.whirlpoolStrength * 12;
-            const hole = this.ctx.createRadialGradient(cx - 10, cy - 10, 2, cx, cy, holeR);
-            hole.addColorStop(0, 'rgba(10, 35, 80, 0.85)');
-            hole.addColorStop(0.35, 'rgba(40, 90, 170, 0.35)');
-            hole.addColorStop(1, 'rgba(140, 210, 255, 0.00)');
-            this.ctx.fillStyle = hole;
-            this.ctx.beginPath();
-            this.ctx.ellipse(cx, cy, holeR * 1.05, holeR * 0.72, 0, 0, Math.PI * 2);
-            this.ctx.fill();
-
-            // Spiral lines for motion
-            this.ctx.strokeStyle = 'rgba(170, 230, 255, 0.55)';
-            this.ctx.lineWidth = 2;
-            this.ctx.beginPath();
-            for (let a = 0; a < Math.PI * 11; a += 0.07) {
-                const r = 6 + a * 3.8;
-                const x = cx + Math.cos(a + t) * r;
-                const y = cy + Math.sin(a + t) * r * 0.62;
-                if (a === 0) this.ctx.moveTo(x, y);
-                else this.ctx.lineTo(x, y);
-            }
-            this.ctx.stroke();
-            this.ctx.restore();
-        }
+        // Whirlpool visualization intentionally removed per request (keep physics sink only)
     }
 
     renderStream() {
@@ -451,15 +446,8 @@ class WaterSimulation {
 
         if (!Number.isFinite(x) || !Number.isFinite(surfaceY)) return;
 
-        // Compute a plausible end point (if there are droplets, use the lowest one)
-        let endY = Math.min(surfaceY - 2, this.height);
-        if (this.droplets.length > 0) {
-            let maxY = -Infinity;
-            for (const d of this.droplets) {
-                if (d.y > maxY) maxY = d.y;
-            }
-            endY = Math.min(surfaceY - 2, Math.max(0, maxY));
-        }
+        // Compute a plausible end point: connect stream directly to surface
+        let endY = Math.max(0, Math.min(this.height, surfaceY - 1));
 
         // Guard against non-finite geometry
         if (!Number.isFinite(endY)) return;
@@ -467,7 +455,7 @@ class WaterSimulation {
 
         const t = performance.now() * 0.001;
         const w = this.streamWidth * (0.85 + 0.25 * Math.sin(t * 2.1));
-        const wob = Math.sin(t * 3.0) * (this.streamWidth * 0.35);
+        const wob = Math.sin(t * 1.4) * (this.streamWidth * 0.20); // slower, smaller wobble
 
         if (!Number.isFinite(w) || w <= 0) return;
 
@@ -484,33 +472,41 @@ class WaterSimulation {
         this.ctx.lineCap = 'round';
 
         this.ctx.beginPath();
-        this.ctx.moveTo(x + wob * 0.10, -10);
+        this.ctx.moveTo(x + wob * 0.08, -10);
         this.ctx.quadraticCurveTo(
-            x + wob * 0.55,
-            endY * 0.35,
-            x - wob * 0.35,
-            endY * 0.72
+            x + wob * 0.25,
+            endY * 0.45,
+            x - wob * 0.18,
+            endY * 0.78
         );
-        this.ctx.quadraticCurveTo(x + wob * 0.25, endY * 0.90, x, endY);
+        this.ctx.quadraticCurveTo(x + wob * 0.12, endY * 0.94, x, endY);
         this.ctx.stroke();
 
         // Specular thread inside the stream
-        this.ctx.strokeStyle = 'rgba(255,255,255,0.14)';
-        this.ctx.lineWidth = Math.max(1.2, w * 0.22);
+        this.ctx.strokeStyle = 'rgba(255,255,255,0.10)';
+        this.ctx.lineWidth = Math.max(1.0, w * 0.18);
         this.ctx.beginPath();
-        this.ctx.moveTo(x - w * 0.15, -10);
-        this.ctx.quadraticCurveTo(x + wob * 0.35, endY * 0.45, x - w * 0.10, endY);
+        this.ctx.moveTo(x - w * 0.12, -10);
+        this.ctx.quadraticCurveTo(x + wob * 0.18, endY * 0.50, x - w * 0.06, endY);
         this.ctx.stroke();
 
         // Small splash brightness at impact
         if (endY > 10 && waterHeight > 0.5) {
-            const splash = this.ctx.createRadialGradient(x, surfaceY, 1, x, surfaceY, 28);
-            splash.addColorStop(0, 'rgba(255,255,255,0.18)');
+            const splash = this.ctx.createRadialGradient(x, surfaceY, 1, x, surfaceY, 32);
+            splash.addColorStop(0, 'rgba(255,255,255,0.12)');
             splash.addColorStop(1, 'rgba(255,255,255,0.00)');
             this.ctx.fillStyle = splash;
             this.ctx.beginPath();
-            this.ctx.ellipse(x, surfaceY, 26, 10, 0, 0, Math.PI * 2);
+            this.ctx.ellipse(x, surfaceY + 2, 34, 12, 0, 0, Math.PI * 2);
             this.ctx.fill();
+
+            // planar smear at impact for a more grounded look
+            this.ctx.strokeStyle = 'rgba(180, 220, 255, 0.35)';
+            this.ctx.lineWidth = 6;
+            this.ctx.beginPath();
+            this.ctx.moveTo(x - 26, surfaceY + 2);
+            this.ctx.lineTo(x + 26, surfaceY + 2);
+            this.ctx.stroke();
         }
 
         this.ctx.restore();
@@ -518,9 +514,10 @@ class WaterSimulation {
 
     startDraining() {
         this.isDraining = true;
+        // Keep sink effect but disable whirlpool visuals
         this.whirlpoolActive = true;
         this.whirlpoolCenter = { x: this.width / 2, y: this.height - 50 };
-        this.whirlpoolStrength = 0.6;
+        this.whirlpoolStrength = 0.45;
         // Drain out over ~2.5 seconds (tuned)
         this.drainRate = this.waterVolume / 2.2;
     }
