@@ -4,7 +4,15 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Liquid Timer</title>
-    <link rel="stylesheet" href="styles.css?v=9">
+    <link rel="stylesheet" href="styles.css?v=15">
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.155.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.155.0/examples/jsm/"
+        }
+    }
+    </script>
 </head>
 <body>
     <div class="container">
@@ -23,12 +31,14 @@
                 <input type="number" id="seconds" min="0" max="59" value="0">
             </div>
             <button id="start-btn" class="btn btn-primary">Start Timer</button>
-            <button id="pause-btn" class="btn btn-secondary" style="display: none;">Pause</button>
-            <button id="reset-btn" class="btn btn-secondary" style="display: none;">Reset</button>
         </div>
 
         <div id="timer-display" class="timer-display" style="display: none;">
             <div class="time-text" id="time-text">00:00:00</div>
+            <div class="timer-buttons">
+                <button id="pause-btn" class="btn btn-secondary">Pause</button>
+                <button id="reset-btn" class="btn btn-secondary">Reset</button>
+            </div>
         </div>
 
         <canvas id="water-canvas"></canvas>
@@ -38,7 +48,7 @@
         </div>
     </div>
 
-    <script src="script.js?v=9"></script>
+    <script type="module" src="script.js?v=15"></script>
 </body>
 </html>
 
